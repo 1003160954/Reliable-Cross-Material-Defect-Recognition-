@@ -1,0 +1,899 @@
+# CrystalGuard release code
+# Reliable dual-domain EMA adaptation for cross-material atomic defect recognition
+
+import argparse
+import random
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+from scipy.ndimage import gaussian_filter
+from sklearn.metrics import (
+    accuracy_score, balanced_accuracy_score, f1_score,
+    precision_score, recall_score, roc_auc_score, confusion_matrix
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+
+
+# =========================
+# Basic utilities
+# =========================
+
+def seed_everything(seed=20260901):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True
+
+
+def clean_text(x):
+    return str(x).strip().lower()
+
+
+def add_binary_label(df):
+    df = df.copy()
+    df["material_clean"] = df["material"].astype(str).str.strip()
+    df["fine_clean"] = df["fine_label"].map(clean_text)
+    if "split_within_material" in df.columns:
+        df["split_clean"] = df["split_within_material"].map(clean_text)
+    else:
+        df["split_clean"] = ""
+    df["y"] = (df["fine_clean"] != "bulk").astype(int)
+    path_col = "absolute_path" if "absolute_path" in df.columns else "path"
+    df["_path"] = df[path_col].astype(str)
+    df = df[df["_path"].map(lambda p: Path(p).is_file())].copy()
+    return df
+
+
+def load_manifest(manifest_path):
+    df = pd.read_csv(manifest_path)
+    df = add_binary_label(df)
+    print("Loaded manifest:", len(df))
+    print(df[["material_clean", "fine_clean", "y"]].head())
+    return df
+
+
+# =========================
+# Protocol split
+# =========================
+
+def split_cdte_to_sto(df):
+    p = df["protocol_cdte_to_sto"].map(clean_text)
+    m = df["material_clean"]
+    s = df["split_clean"]
+
+    parts = {
+        "source_train": df[(m == "CdTe") & (p == "train")].copy(),
+        "source_val": df[(m == "CdTe") & (p == "validation")].copy(),
+        "source_test": df[(m == "CdTe") & (p == "test")].copy(),
+
+        "target_unlabeled": df[
+            (m == "SrTiO3")
+            & (p == "external_material_ood")
+            & (s == "train")
+        ].copy(),
+
+        "target_test": df[
+            (m == "SrTiO3")
+            & (p == "external_material_ood")
+            & (s == "test")
+        ].copy(),
+
+        "target_all": df[
+            (m == "SrTiO3")
+            & (p == "external_material_ood")
+        ].copy(),
+    }
+
+    return parts
+
+
+def split_sto_to_cdte(df):
+    m = df["material_clean"]
+    s = df["split_clean"]
+
+    parts = {
+        "source_train": df[(m == "SrTiO3") & (s == "train")].copy(),
+        "source_val": df[(m == "SrTiO3") & (s == "validation")].copy(),
+        "source_test": df[(m == "SrTiO3") & (s == "test")].copy(),
+
+        "target_unlabeled": df[(m == "CdTe") & (s == "train")].copy(),
+        "target_test": df[(m == "CdTe") & (s == "test")].copy(),
+        "target_all": df[m == "CdTe"].copy(),
+    }
+
+    return parts
+
+
+def print_split_summary(parts):
+    for name, part in parts.items():
+        print()
+        print(name, len(part))
+        if len(part) > 0:
+            print(part["y"].map({0: "normal", 1: "defect"}).value_counts())
+
+
+# =========================
+# Image representation
+# =========================
+
+def read_gray(path, size=224):
+    img = Image.open(path).convert("L").resize((size, size), Image.BILINEAR)
+    arr = np.asarray(img).astype(np.float32) / 255.0
+
+    lo, hi = np.percentile(arr, [1, 99])
+    arr = np.clip((arr - lo) / max(hi - lo, 1e-6), 0, 1)
+    return arr
+
+
+def make_channels(arr, mode="full", sigma=3.0):
+    real = arr.astype(np.float32)
+
+    residual = real - gaussian_filter(real, sigma=sigma)
+    residual = (residual - residual.mean()) / (residual.std() + 1e-6)
+    residual = np.clip(residual, -3, 3) / 6.0 + 0.5
+
+    fft = np.fft.fftshift(np.fft.fft2(real))
+    fft = np.log1p(np.abs(fft)).astype(np.float32)
+    fft = (fft - fft.min()) / (fft.max() - fft.min() + 1e-6)
+
+    if mode == "real":
+        x = np.stack([real, real, real])
+    elif mode == "real_fft":
+        x = np.stack([real, fft, real])
+    elif mode == "real_residual":
+        x = np.stack([real, residual, real])
+    elif mode == "full":
+        x = np.stack([real, residual, fft])
+    else:
+        raise ValueError(f"Unknown input mode: {mode}")
+
+    return x.astype(np.float32)
+
+
+class CrystalDataset(Dataset):
+    def __init__(self, df, image_size=224, mode="full", augment=False):
+        self.df = df.reset_index(drop=True)
+        self.image_size = image_size
+        self.mode = mode
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        arr = read_gray(row["_path"], self.image_size)
+
+        if self.augment:
+            if random.random() < 0.5:
+                arr = np.flip(arr, axis=0).copy()
+            if random.random() < 0.5:
+                arr = np.flip(arr, axis=1).copy()
+            arr = np.rot90(arr, random.randint(0, 3)).copy()
+            arr = np.clip(arr + np.random.normal(0, 0.015, arr.shape), 0, 1).astype(np.float32)
+
+        x = make_channels(arr, self.mode)
+
+        return {
+            "x": torch.tensor(x, dtype=torch.float32),
+            "y": torch.tensor(int(row["y"]), dtype=torch.long),
+            "path": row["_path"],
+            "fine_label": str(row["fine_label"]),
+            "material": str(row["material"]),
+        }
+
+
+# =========================
+# Model
+# =========================
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False),
+            nn.GroupNorm(min(8, out_ch), out_ch),
+            nn.SiLU(),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(min(8, out_ch), out_ch),
+        )
+        self.skip = (
+            nn.Identity()
+            if in_ch == out_ch and stride == 1
+            else nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False)
+        )
+
+    def forward(self, x):
+        return F.silu(self.main(x) + self.skip(x))
+
+
+class CrystalGuardNet(nn.Module):
+    def __init__(self, width=32):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, width, 5, stride=2, padding=2, bias=False),
+            nn.GroupNorm(8, width),
+            nn.SiLU(),
+
+            ResidualBlock(width, width * 2, stride=2),
+            ResidualBlock(width * 2, width * 4, stride=2),
+            ResidualBlock(width * 4, width * 8, stride=2),
+            ResidualBlock(width * 8, width * 8, stride=1),
+
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(width * 8, 128),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 2),
+        )
+
+    def forward(self, x):
+        z = self.encoder(x)
+        return self.classifier(z)
+
+
+# =========================
+# Evaluation
+# =========================
+
+@torch.no_grad()
+def predict(model, loader, device):
+    model.eval()
+    rows = []
+
+    for batch in loader:
+        x = batch["x"].to(device)
+        y = batch["y"].cpu().numpy()
+
+        prob = torch.softmax(model(x), dim=1)[:, 1].cpu().numpy()
+        pred = (prob >= 0.5).astype(int)
+
+        for i in range(len(prob)):
+            rows.append({
+                "path": batch["path"][i],
+                "material": batch["material"][i],
+                "fine_label": batch["fine_label"][i],
+                "y": int(y[i]),
+                "prob_defect": float(prob[i]),
+                "pred_y": int(pred[i]),
+                "correct": int(pred[i] == y[i]),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def metrics_from_scores(scores, split, experiment):
+    y = scores["y"].astype(int).to_numpy()
+    p = scores["prob_defect"].astype(float).to_numpy()
+    pred = (p >= 0.5).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+
+    try:
+        auc = roc_auc_score(y, p)
+    except Exception:
+        auc = np.nan
+
+    return {
+        "experiment": experiment,
+        "split": split,
+        "n": len(scores),
+        "acc": accuracy_score(y, pred),
+        "balanced_acc": balanced_accuracy_score(y, pred),
+        "f1_defect": f1_score(y, pred, zero_division=0),
+        "precision_defect": precision_score(y, pred, zero_division=0),
+        "recall_defect": recall_score(y, pred, zero_division=0),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+        "auc": auc,
+    }
+
+
+def make_sampler(labels):
+    labels = np.asarray(labels).astype(int)
+    counts = np.bincount(labels, minlength=2).astype(np.float32)
+    weights = 1.0 / np.maximum(counts, 1.0)
+    sample_weights = weights[labels]
+    return WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+
+
+def update_ema(student, teacher, alpha=0.995):
+    with torch.no_grad():
+        for pt, ps in zip(teacher.parameters(), student.parameters()):
+            pt.data.mul_(alpha).add_(ps.data, alpha=1 - alpha)
+
+
+# =========================
+# Training
+# =========================
+
+def train_source_epoch(model, loader, optimizer, device):
+    model.train()
+    losses = []
+
+    for batch in loader:
+        x = batch["x"].to(device)
+        y = batch["y"].to(device)
+
+        loss = F.cross_entropy(model(x), y)
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        optimizer.step()
+
+        losses.append(float(loss.detach().cpu()))
+
+    return float(np.mean(losses))
+
+
+def train_adapt_epoch(
+    student,
+    teacher,
+    source_loader,
+    target_loader,
+    optimizer,
+    device,
+    target_prior,
+    lambda_pseudo=0.6,
+    lambda_cons=0.15,
+    lambda_prior=0.10,
+    conf_threshold=0.90,
+):
+    student.train()
+    teacher.eval()
+
+    target_iter = iter(target_loader)
+    losses = []
+
+    for source_batch in source_loader:
+        try:
+            target_batch = next(target_iter)
+        except StopIteration:
+            target_iter = iter(target_loader)
+            target_batch = next(target_iter)
+
+        xs = source_batch["x"].to(device)
+        ys = source_batch["y"].to(device)
+        xt = target_batch["x"].to(device)
+
+        logits_s = student(xs)
+        source_loss = F.cross_entropy(logits_s, ys)
+
+        with torch.no_grad():
+            teacher_prob = torch.softmax(teacher(xt), dim=1)
+            conf, pseudo = teacher_prob.max(dim=1)
+            mask = conf >= conf_threshold
+
+        logits_t = student(xt)
+        student_prob = torch.softmax(logits_t, dim=1)
+
+        if mask.any():
+            pseudo_loss = F.cross_entropy(logits_t[mask], pseudo[mask])
+        else:
+            pseudo_loss = torch.zeros((), device=device)
+
+        cons_loss = F.mse_loss(student_prob, teacher_prob)
+
+        pred_ratio = student_prob[:, 1].mean()
+        prior_loss = (pred_ratio - target_prior) ** 2
+
+        loss = (
+            source_loss
+            + lambda_pseudo * pseudo_loss
+            + lambda_cons * cons_loss
+            + lambda_prior * prior_loss
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(student.parameters(), 5.0)
+        optimizer.step()
+
+        update_ema(student, teacher)
+
+        losses.append(float(loss.detach().cpu()))
+
+    return float(np.mean(losses))
+
+
+def run_forward_cdte_to_sto(args):
+    seed_everything(args.seed)
+
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Device:", device)
+
+    df = load_manifest(args.manifest)
+    parts = split_cdte_to_sto(df)
+    print_split_summary(parts)
+
+    for k, v in parts.items():
+        assert len(v) > 0, f"Empty split: {k}"
+
+    source_train = parts["source_train"]
+    source_val = parts["source_val"]
+
+    train_ds = CrystalDataset(source_train, args.image_size, args.input_mode, augment=True)
+    val_ds = CrystalDataset(source_val, args.image_size, args.input_mode, augment=False)
+    target_ds = CrystalDataset(parts["target_unlabeled"], args.image_size, args.input_mode, augment=True)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        sampler=make_sampler(source_train["y"].to_numpy()),
+        num_workers=0,
+    )
+
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    target_loader = DataLoader(target_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+
+    student = CrystalGuardNet(width=args.width).to(device)
+    teacher = CrystalGuardNet(width=args.width).to(device)
+    teacher.load_state_dict(student.state_dict())
+
+    optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # Important:
+    # Do NOT use target-unlabeled true labels here.
+    # Default prior comes from source train. If you have an external prior, pass --target-prior.
+    if args.target_prior is None:
+        target_prior = float(source_train["y"].mean())
+    else:
+        target_prior = float(args.target_prior)
+    target_prior = float(np.clip(target_prior, 0.50, 0.95))
+
+    print("Target prior used by non-collapse loss:", target_prior)
+
+    logs = []
+    best_score = -1
+    best_state = None
+
+    print("\nStage 1: source warmup")
+    for epoch in range(1, args.warmup_epochs + 1):
+        loss = train_source_epoch(student, train_loader, optimizer, device)
+        update_ema(student, teacher)
+
+        val_scores = predict(teacher, val_loader, device)
+        val_m = metrics_from_scores(val_scores, "source_val_CdTe", "warmup")
+        select = 0.7 * val_m["balanced_acc"] + 0.3 * val_m["auc"]
+
+        logs.append({
+            "stage": "warmup",
+            "epoch": epoch,
+            "loss": loss,
+            "source_val_balanced_acc": val_m["balanced_acc"],
+            "source_val_auc": val_m["auc"],
+            "selection_score_no_target_label": select,
+        })
+
+        print(
+            f"warmup {epoch:02d}/{args.warmup_epochs} | "
+            f"loss={loss:.4f} | val_BA={val_m['balanced_acc']:.4f} | "
+            f"val_AUC={val_m['auc']:.4f} | select={select:.4f}"
+        )
+
+        if select > best_score:
+            best_score = select
+            best_state = {k: v.detach().cpu().clone() for k, v in teacher.state_dict().items()}
+
+    teacher.load_state_dict(best_state)
+    student.load_state_dict(best_state)
+
+    print("\nStage 2: reliable target adaptation")
+    for epoch in range(1, args.adapt_epochs + 1):
+        loss = train_adapt_epoch(
+            student,
+            teacher,
+            train_loader,
+            target_loader,
+            optimizer,
+            device,
+            target_prior=target_prior,
+            lambda_pseudo=args.lambda_pseudo,
+            lambda_cons=args.lambda_cons,
+            lambda_prior=args.lambda_prior,
+            conf_threshold=args.conf_threshold,
+        )
+
+        val_scores = predict(teacher, val_loader, device)
+        val_m = metrics_from_scores(val_scores, "source_val_CdTe", "adapt")
+        select = 0.7 * val_m["balanced_acc"] + 0.3 * val_m["auc"]
+
+        logs.append({
+            "stage": "adapt",
+            "epoch": epoch,
+            "loss": loss,
+            "source_val_balanced_acc": val_m["balanced_acc"],
+            "source_val_auc": val_m["auc"],
+            "selection_score_no_target_label": select,
+        })
+
+        print(
+            f"adapt {epoch:02d}/{args.adapt_epochs} | "
+            f"loss={loss:.4f} | val_BA={val_m['balanced_acc']:.4f} | "
+            f"val_AUC={val_m['auc']:.4f} | select={select:.4f}"
+        )
+
+        if select > best_score:
+            best_score = select
+            best_state = {k: v.detach().cpu().clone() for k, v in teacher.state_dict().items()}
+
+    teacher.load_state_dict(best_state)
+
+    torch.save(teacher.state_dict(), out / "crystalguard_forward_best.pt")
+    pd.DataFrame(logs).to_csv(out / "training_log.csv", index=False)
+
+    all_metrics = []
+    all_scores = []
+
+    eval_map = {
+        "source_test_CdTe": parts["source_test"],
+        "target_test_SrTiO3": parts["target_test"],
+        "target_all_SrTiO3": parts["target_all"],
+    }
+
+    for split_name, split_df in eval_map.items():
+        loader = DataLoader(
+            CrystalDataset(split_df, args.image_size, args.input_mode, augment=False),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+
+        scores = predict(teacher, loader, device)
+        scores["split"] = split_name
+        all_scores.append(scores)
+
+        m = metrics_from_scores(scores, split_name, "crystalguard_reliable_dual_domain_ema")
+        all_metrics.append(m)
+
+    metrics_df = pd.DataFrame(all_metrics)
+    scores_df = pd.concat(all_scores, ignore_index=True)
+
+    metrics_df.to_csv(out / "eval_results.csv", index=False)
+    scores_df.to_csv(out / "prediction_scores.csv", index=False)
+
+    print("\nFinal evaluation")
+    print(metrics_df)
+
+    return metrics_df
+
+
+# =========================
+# Reverse few-shot calibration
+# =========================
+
+def image_features(path, size=224):
+    arr = read_gray(path, size)
+    residual = arr - gaussian_filter(arr, sigma=3.0)
+
+    fft = np.fft.fftshift(np.fft.fft2(arr))
+    fft = np.log1p(np.abs(fft))
+
+    gy, gx = np.gradient(arr)
+    grad = np.sqrt(gx * gx + gy * gy)
+
+    feats = [
+        arr.mean(), arr.std(),
+        np.percentile(arr, 5),
+        np.percentile(arr, 50),
+        np.percentile(arr, 95),
+
+        grad.mean(), grad.std(),
+
+        residual.mean(), residual.std(),
+        np.percentile(np.abs(residual), 95),
+
+        fft.mean(), fft.std(),
+        fft.max() / (fft.mean() + 1e-6),
+    ]
+
+    return np.array(feats, dtype=np.float32)
+
+
+def run_reverse_fewshot(args):
+    seed_everything(args.seed)
+
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+
+    df = load_manifest(args.manifest)
+    parts = split_sto_to_cdte(df)
+    print_split_summary(parts)
+
+    train_pool = parts["target_unlabeled"].reset_index(drop=True)
+    test_set = parts["target_test"].reset_index(drop=True)
+
+    print("\nExtracting image features...")
+    x_train = np.stack([image_features(p, args.image_size) for p in train_pool["_path"]])
+    y_train = train_pool["y"].astype(int).to_numpy()
+
+    x_test = np.stack([image_features(p, args.image_size) for p in test_set["_path"]])
+    y_test = test_set["y"].astype(int).to_numpy()
+
+    rows = []
+    score_rows = []
+
+    ks = [int(x) for x in args.k_values.split(",")]
+    seeds = [int(x) for x in args.seeds.split(",")]
+
+    for k in ks:
+        for seed in seeds:
+            rng = np.random.default_rng(seed)
+
+            selected = []
+            for fine, group in train_pool.groupby("fine_clean"):
+                idx = group.index.to_numpy()
+                take = min(k, len(idx))
+                selected.extend(rng.choice(idx, size=take, replace=False).tolist())
+
+            selected = np.array(selected)
+
+            clf = make_pipeline(
+                StandardScaler(),
+                LogisticRegression(
+                    max_iter=3000,
+                    class_weight="balanced",
+                    solver="liblinear",
+                )
+            )
+
+            clf.fit(x_train[selected], y_train[selected])
+
+            prob = clf.predict_proba(x_test)[:, 1]
+            pred = (prob >= 0.5).astype(int)
+
+            scores = pd.DataFrame({
+                "path": test_set["_path"],
+                "fine_label": test_set["fine_label"],
+                "fine_clean": test_set["fine_clean"],
+                "y": y_test,
+                "prob_defect": prob,
+                "pred_y": pred,
+            })
+
+            m = metrics_from_scores(
+                scores,
+                "target_test_CdTe",
+                f"reverse_fewshot_k{k}_logistic"
+            )
+            m["k_per_fine_label"] = k
+            m["seed"] = seed
+            rows.append(m)
+
+            scores["k_per_fine_label"] = k
+            scores["seed"] = seed
+            score_rows.append(scores)
+
+            print(
+                f"k={k:02d} seed={seed} | "
+                f"BA={m['balanced_acc']:.4f} | AUC={m['auc']:.4f} | "
+                f"TN={m['tn']} FP={m['fp']} FN={m['fn']} TP={m['tp']}"
+            )
+
+    results = pd.DataFrame(rows)
+    scores_all = pd.concat(score_rows, ignore_index=True)
+
+    summary = results.groupby("k_per_fine_label").agg(
+        n_runs=("seed", "nunique"),
+        ba_mean=("balanced_acc", "mean"),
+        ba_std=("balanced_acc", "std"),
+        auc_mean=("auc", "mean"),
+        auc_std=("auc", "std"),
+        acc_mean=("acc", "mean"),
+        acc_std=("acc", "std"),
+        fp_mean=("fp", "mean"),
+        fp_std=("fp", "std"),
+        fn_mean=("fn", "mean"),
+        fn_std=("fn", "std"),
+        best_ba=("balanced_acc", "max"),
+        worst_ba=("balanced_acc", "min"),
+    ).reset_index()
+
+    results.to_csv(out / "reverse_fewshot_results.csv", index=False)
+    summary.to_csv(out / "reverse_fewshot_summary.csv", index=False)
+    scores_all.to_csv(out / "reverse_fewshot_scores.csv", index=False)
+
+    print("\nFew-shot summary")
+    print(summary)
+
+    return summary
+
+
+# =========================
+# Plot official summary
+# =========================
+
+def make_summary_figures(args):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+
+    sns.set_theme(style="whitegrid", font_scale=1.1)
+
+    forward = pd.DataFrame({
+        "split": ["source_test_CdTe", "target_test_SrTiO3", "target_all_SrTiO3"],
+        "balanced_acc_mean": [0.991954, 0.932817, 0.940686],
+        "balanced_acc_std": [0.005267, 0.015889, 0.016241],
+        "auc_mean": [1.000000, 0.989788, 0.984706],
+        "auc_std": [0.000000, 0.006731, 0.005541],
+    })
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.0))
+    colors = ["#7895CB", "#D95F5F", "#8AB17D"]
+    ax.bar(
+        forward["split"],
+        forward["balanced_acc_mean"],
+        yerr=forward["balanced_acc_std"],
+        capsize=4,
+        color=colors,
+    )
+    ax.axhline(0.5, color="0.35", ls="--", lw=1)
+    ax.set_ylim(0.45, 1.02)
+    ax.set_ylabel("Balanced accuracy")
+    ax.set_title("Reliable dual-domain EMA: CdTe to SrTiO3")
+    ax.tick_params(axis="x", rotation=15)
+
+    for i, r in forward.iterrows():
+        ax.text(i, r["balanced_acc_mean"] + 0.018, f"{r['balanced_acc_mean']:.3f}", ha="center")
+
+    fig.tight_layout()
+    fig.savefig(out / "01_forward_main_result.png", dpi=300)
+    plt.close(fig)
+
+    reverse = pd.DataFrame({
+        "k": [1, 2, 3, 5, 10],
+        "ba_mean": [0.768276, 0.890172, 0.928276, 0.934828, 0.950000],
+        "ba_std": [0.122348, 0.071306, 0.033593, 0.028411, 0.017565],
+        "auc_mean": [0.871403, 0.951427, 0.970178, 0.975386, 0.981653],
+        "auc_std": [0.104227, 0.039013, 0.020117, 0.011861, 0.003724],
+    })
+
+    fig, ax = plt.subplots(figsize=(6.6, 4.0))
+    ax.errorbar(
+        reverse["k"],
+        reverse["ba_mean"],
+        yerr=reverse["ba_std"],
+        marker="o",
+        lw=2,
+        capsize=4,
+        color="#E07A5F",
+    )
+    ax.axhline(0.5, color="0.35", ls="--", lw=1)
+    ax.set_ylim(0.45, 1.02)
+    ax.set_xlabel("Labeled target examples per fine class")
+    ax.set_ylabel("Balanced accuracy")
+    ax.set_title("Few-shot calibration repairs reverse transfer")
+
+    for _, r in reverse.iterrows():
+        ax.text(r["k"], r["ba_mean"] + 0.025, f"{r['ba_mean']:.3f}", ha="center")
+
+    fig.tight_layout()
+    fig.savefig(out / "02_reverse_fewshot_summary.png", dpi=300)
+    plt.close(fig)
+
+    ablation = pd.DataFrame({
+        "method": [
+            "Source-only",
+            "Target SSL only",
+            "Real-space only",
+            "No EMA teacher",
+            "Real + residual",
+            "Real + FFT",
+            "Official full method",
+        ],
+        "balanced_acc": [
+            0.500000,
+            0.500000,
+            0.742513,
+            0.879690,
+            0.927711,
+            0.929260,
+            0.932817,
+        ],
+    }).sort_values("balanced_acc")
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.3))
+    colors = ["#D95F5F" if x == "Official full method" else "#4C78A8" for x in ablation["method"]]
+    ax.barh(ablation["method"], ablation["balanced_acc"], color=colors)
+    ax.axvline(0.5, color="0.35", ls="--", lw=1)
+    ax.set_xlim(0.45, 1.0)
+    ax.set_xlabel("Balanced accuracy on target-test SrTiO3")
+    ax.set_title("Ablation summary")
+
+    for y, v in enumerate(ablation["balanced_acc"]):
+        ax.text(v + 0.006, y, f"{v:.3f}", va="center")
+
+    fig.tight_layout()
+    fig.savefig(out / "03_ablation_summary.png", dpi=300)
+    plt.close(fig)
+
+    print("Saved figures to:", out)
+
+
+# =========================
+# Command line
+# =========================
+
+def build_parser():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--task",
+        choices=["forward", "reverse_fewshot", "figures"],
+        required=True,
+    )
+
+    parser.add_argument("--manifest", default=None)
+    parser.add_argument("--output", required=True)
+
+    parser.add_argument("--seed", type=int, default=20260901)
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--batch-size", type=int, default=32)
+
+    parser.add_argument("--input-mode", default="full", choices=["real", "real_fft", "real_residual", "full"])
+    parser.add_argument("--width", type=int, default=32)
+
+    parser.add_argument("--warmup-epochs", type=int, default=10)
+    parser.add_argument("--adapt-epochs", type=int, default=25)
+
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+
+    parser.add_argument("--lambda-pseudo", type=float, default=0.6)
+    parser.add_argument("--lambda-cons", type=float, default=0.15)
+    parser.add_argument("--lambda-prior", type=float, default=0.10)
+    parser.add_argument("--conf-threshold", type=float, default=0.90)
+    parser.add_argument("--target-prior", type=float, default=None)
+
+    parser.add_argument("--k-values", default="1,2,3,5,10")
+    parser.add_argument(
+        "--seeds",
+        default="20260901,20260902,20260903,20260904,20260905,"
+                "20260906,20260907,20260908,20260909,20260910,"
+                "20260911,20260912,20260913,20260914,20260915,"
+                "20260916,20260917,20260918,20260919,20260920"
+    )
+
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+
+    if args.task in ["forward", "reverse_fewshot"]:
+        assert args.manifest is not None, "--manifest is required"
+
+    if args.task == "forward":
+        run_forward_cdte_to_sto(args)
+    elif args.task == "reverse_fewshot":
+        run_reverse_fewshot(args)
+    elif args.task == "figures":
+        make_summary_figures(args)
+
+
+if __name__ == "__main__":
+    main()
